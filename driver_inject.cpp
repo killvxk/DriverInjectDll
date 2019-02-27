@@ -1,4 +1,5 @@
 
+
 #include "undocumented.h"
 #include "ssdt.h"
 #include "ntdll.h"
@@ -30,8 +31,8 @@ PVOID NTAPI PsGetProcessWow64Process(PEPROCESS process);
 extern "C"
 NTKERNELAPI
 NTSTATUS NTAPI PsLookupProcessByProcessId(
-_In_ HANDLE ProcessId,
-_Outptr_ PEPROCESS *Process
+	_In_ HANDLE ProcessId,
+	_Outptr_ PEPROCESS *Process
 );
 
 //
@@ -69,19 +70,19 @@ typedef NTSTATUS(NTAPI* fn_NtProtectVirtualMemory)(
 	);
 
 
-typedef struct _INJECT_PROCESSID_LIST{			//注入列表信息
+typedef struct _INJECT_PROCESSID_LIST {			//注入列表信息
 	LIST_ENTRY	link;
 	HANDLE pid;
 	BOOLEAN	inject;
 }INJECT_PROCESSID_LIST, *PINJECT_PROCESSID_LIST;
 
-typedef struct _INJECT_PROCESSID_DATA{			//注入进程数据信息
+typedef struct _INJECT_PROCESSID_DATA {			//注入进程数据信息
 	HANDLE	pid;
 	PVOID	imagebase;
 	SIZE_T	imagesize;
 }INJECT_PROCESSID_DATA, *PINJECT_PROCESSID_DATA;
 
-typedef struct _INJECT_PROCESSID_DLL{			//内存加载DLL信息
+typedef struct _INJECT_PROCESSID_DLL {			//内存加载DLL信息
 	PVOID	x64dll;
 	ULONG	x64dllsize;
 	PVOID	x86dll;
@@ -93,7 +94,7 @@ typedef struct _INJECT_PROCESSID_DLL{			//内存加载DLL信息
 //
 //x86 payload
 //
-typedef struct _INJECT_PROCESSID_PAYLOAD_X86{
+typedef struct _INJECT_PROCESSID_PAYLOAD_X86 {
 	UCHAR	saveReg[2]; //pushad //pushfd
 	UCHAR	restoneHook[17]; // mov esi,5 mov edi,123 mov esi,456 rep movs byte
 	UCHAR	invokeMemLoad[10]; // push xxxxxx call xxxxxx
@@ -111,12 +112,14 @@ typedef struct _INJECT_PROCESSID_PAYLOAD_X86{
 //
 // x64 payload
 //
-typedef struct _INJECT_PROCESSID_PAYLOAD_X64{
+typedef struct _INJECT_PROCESSID_PAYLOAD_X64 {
+	UCHAR	saveReg[25];
 	UCHAR	subStack[4];
 	UCHAR	restoneHook[32]; // mov rcx,xxxx mov rdi,xxxx mov rsi,xxx rep movs byte
 	UCHAR	invokeMemLoad[15]; // mov rcx,xxxxx call xxxx
 	UCHAR	eraseDll[24]; // mov rdi,xxxx xor eax,eax mov rcx,xxxxx rep stosb
 	UCHAR	addStack[4];
+	UCHAR	restoneReg[27];
 	UCHAR	jmpOld[14]; //jmp qword [0]
 
 	UCHAR	oldData[14];//
@@ -133,7 +136,9 @@ typedef struct _INJECT_PROCESSID_PAYLOAD_X64{
 //
 INJECT_PROCESSID_LIST	g_injectList;
 INJECT_PROCESSID_DLL	g_injectDll;
-KGUARDED_MUTEX			g_GuardMutex;
+ERESOURCE			g_ResourceMutex;
+NPAGED_LOOKASIDE_LIST g_injectListLookaside;
+NPAGED_LOOKASIDE_LIST g_injectDataLookaside;
 
 fn_NtAllocateVirtualMemory	pfn_NtAllocateVirtualMemory;
 fn_NtReadVirtualMemory		pfn_NtReadVirtualMemory;
@@ -145,18 +150,23 @@ fn_NtProtectVirtualMemory	pfn_NtProtectVirtualMemory;
 //
 BOOLEAN QueryInjectListStatus(HANDLE	processid)
 {
-	BOOLEAN result = false;
+	BOOLEAN result = FALSE;
 
-	KeAcquireGuardedMutex(&g_GuardMutex);
+	KeEnterCriticalRegion();
+	ExAcquireResourceSharedLite(&g_ResourceMutex, TRUE);
 
 	PLIST_ENTRY	head = &g_injectList.link;
 	PINJECT_PROCESSID_LIST next = (PINJECT_PROCESSID_LIST)g_injectList.link.Blink;
 
 	while (head != (PLIST_ENTRY)next)
 	{
-		if (next->pid == processid && next->inject == TRUE)
+		if (next->pid == processid)
 		{
-			result = TRUE;
+			if (next->inject == TRUE)
+			{
+				result = TRUE;
+			}
+			
 			break;
 		}
 
@@ -164,7 +174,9 @@ BOOLEAN QueryInjectListStatus(HANDLE	processid)
 	}
 
 
-	KeReleaseGuardedMutex(&g_GuardMutex);
+	ExReleaseResourceLite(&g_ResourceMutex);
+	KeLeaveCriticalRegion();
+
 	return result;
 }
 
@@ -173,7 +185,8 @@ BOOLEAN QueryInjectListStatus(HANDLE	processid)
 //
 VOID SetInjectListStatus(HANDLE	processid)
 {
-	KeAcquireGuardedMutex(&g_GuardMutex);
+	KeEnterCriticalRegion();
+	ExAcquireResourceExclusiveLite(&g_ResourceMutex, TRUE);
 
 	PLIST_ENTRY	head = &g_injectList.link;
 	PINJECT_PROCESSID_LIST next = (PINJECT_PROCESSID_LIST)g_injectList.link.Blink;
@@ -190,7 +203,9 @@ VOID SetInjectListStatus(HANDLE	processid)
 	}
 
 
-	KeReleaseGuardedMutex(&g_GuardMutex);
+	ExReleaseResourceLite(&g_ResourceMutex);
+	KeLeaveCriticalRegion();
+
 }
 
 //
@@ -198,12 +213,13 @@ VOID SetInjectListStatus(HANDLE	processid)
 //
 VOID AddInjectList(HANDLE processid)
 {
-	//DbgPrint("%s %d\n", __FUNCTION__, processid);
+	//DPRINT("%s %d\n", __FUNCTION__, processid);
 
-	KeAcquireGuardedMutex(&g_GuardMutex);
+	KeEnterCriticalRegion();
+	ExAcquireResourceExclusiveLite(&g_ResourceMutex, TRUE);
 
 	PINJECT_PROCESSID_LIST newLink = (PINJECT_PROCESSID_LIST)\
-		ExAllocatePoolWithTag(PagedPool, sizeof(INJECT_PROCESSID_LIST), TAG_INJECTLIST);
+		ExAllocateFromNPagedLookasideList(&g_injectListLookaside);
 
 	if (newLink == NULL)
 	{
@@ -214,7 +230,8 @@ VOID AddInjectList(HANDLE processid)
 
 	InsertTailList(&g_injectList.link, (PLIST_ENTRY)newLink);
 
-	KeReleaseGuardedMutex(&g_GuardMutex);
+	ExReleaseResourceLite(&g_ResourceMutex);
+	KeLeaveCriticalRegion();
 }
 
 //
@@ -222,9 +239,10 @@ VOID AddInjectList(HANDLE processid)
 //
 VOID DeleteInjectList(HANDLE processid)
 {
-	//DbgPrint("%s %d\n", __FUNCTION__, processid);
+	//DPRINT("%s %d\n", __FUNCTION__, processid);
 
-	KeAcquireGuardedMutex(&g_GuardMutex);
+	KeEnterCriticalRegion();
+	ExAcquireResourceExclusiveLite(&g_ResourceMutex, TRUE);
 
 	PLIST_ENTRY	head = &g_injectList.link;
 	PINJECT_PROCESSID_LIST next = (PINJECT_PROCESSID_LIST)g_injectList.link.Blink;
@@ -234,7 +252,7 @@ VOID DeleteInjectList(HANDLE processid)
 		if (next->pid == processid)
 		{
 			RemoveEntryList(&next->link);
-			ExFreePoolWithTag(&next->link, TAG_INJECTLIST);
+			ExFreeToNPagedLookasideList(&g_injectListLookaside, &next->link);
 			break;
 		}
 
@@ -242,7 +260,8 @@ VOID DeleteInjectList(HANDLE processid)
 	}
 
 
-	KeReleaseGuardedMutex(&g_GuardMutex);
+	ExReleaseResourceLite(&g_ResourceMutex);
+	KeLeaveCriticalRegion();
 }
 
 //
@@ -300,12 +319,12 @@ ULONG_PTR GetProcAddressR(ULONG_PTR hModule, const char* lpProcName, bool x64Mod
 		uiNameOrdinals = (uiLibraryAddress + pExportDirectory->AddressOfNameOrdinals);
 
 		// test if we are importing by name or by ordinal...
-		if (((unsigned long)lpProcName & 0xFFFF0000) == 0x00000000)
+		if ((PtrToUlong(lpProcName) & 0xFFFF0000) == 0x00000000)
 		{
 			// import by ordinal...
 
 			// use the import ordinal (- export ordinal base) as an index into the array of addresses
-			uiAddressArray += ((IMAGE_ORDINAL((unsigned long)lpProcName) - pExportDirectory->Base) * sizeof(unsigned long));
+			uiAddressArray += ((IMAGE_ORDINAL(PtrToUlong(lpProcName)) - pExportDirectory->Base) * sizeof(unsigned long));
 
 			// resolve the address for this imported function
 			fpResult = (ULONG_PTR)(uiLibraryAddress + DEREF_32(uiAddressArray));
@@ -348,6 +367,37 @@ ULONG_PTR GetProcAddressR(ULONG_PTR hModule, const char* lpProcName, bool x64Mod
 }
 
 //
+// 搜索字符串,来自blackbone
+//
+LONG SafeSearchString(IN PUNICODE_STRING source, IN PUNICODE_STRING target, IN BOOLEAN CaseInSensitive)
+{
+	ASSERT(source != NULL && target != NULL);
+	if (source == NULL || target == NULL || source->Buffer == NULL || target->Buffer == NULL)
+		return STATUS_INVALID_PARAMETER;
+
+	// Size mismatch
+	if (source->Length < target->Length)
+		return -1;
+
+	USHORT diff = source->Length - target->Length;
+	for (USHORT i = 0; i <= (diff / sizeof(WCHAR)); i++)
+	{
+ 		if (RtlCompareUnicodeStrings(
+			source->Buffer + i ,
+			target->Length / sizeof(WCHAR),
+			target->Buffer,
+			target->Length / sizeof(WCHAR),
+			CaseInSensitive
+		) == 0)
+		{
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+//
 //注入线程
 //
 VOID INJECT_ROUTINE_X86(
@@ -356,11 +406,11 @@ VOID INJECT_ROUTINE_X86(
 
 	PINJECT_PROCESSID_DATA	injectdata = (PINJECT_PROCESSID_DATA)StartContext;
 
-	DbgPrint("x86注入 pid=%d %p\n", injectdata->pid, injectdata->imagebase);
+	DPRINT("x86注入 pid=%d %p\n", injectdata->pid, injectdata->imagebase);
 
 
 	//
-	//1.attach进程，2.找导出表ZwTestAlert 3.组合shellcode 4.申请内存  5.Hook ZwTestAlert 
+	//1.attach进程，2.找导出表ZwContinue 3.组合shellcode 4.申请内存  5.Hook ZwContinue 
 	//
 
 	ULONG			trace = 1;
@@ -370,8 +420,8 @@ VOID INJECT_ROUTINE_X86(
 	KAPC_STATE		apc;
 	BOOLEAN			attach = false;
 
-	ULONG64			pfnZwTestAlert = 0;
-	PVOID			pZwTestAlert;
+	ULONG64			pfnZwContinue = 0;
+	PVOID			pZwContinue;
 
 	PVOID			alloc_ptr = NULL;
 	SIZE_T			alloc_size = 0;
@@ -396,27 +446,27 @@ VOID INJECT_ROUTINE_X86(
 	{
 		goto __exit;
 	}
+	ObDereferenceObject(process);
+
 	trace = 2;
 	KeStackAttachProcess(process, &apc);
 	attach = true;
 
-	ObDereferenceObject(process);
-
 	//
-	//2.找导出表ZwTestAlert
+	//2.找导出表ZwContinue
 	//
-	pfnZwTestAlert = (ULONG)GetProcAddressR((ULONG_PTR)injectdata->imagebase, "ZwTestAlert", false);
-	if (pfnZwTestAlert == NULL)
+	pfnZwContinue = (ULONG)GetProcAddressR((ULONG_PTR)injectdata->imagebase, "ZwContinue", false);
+	if (pfnZwContinue == NULL)
 	{
 		goto __exit;
 	}
 	trace = 3;
 
 	status = pfn_NtReadVirtualMemory(NtCurrentProcess(),
-									 (PVOID)pfnZwTestAlert,
-									 &payload.oldData,
-									 sizeof(payload.oldData),
-									 NULL);
+		(PVOID)pfnZwContinue,
+		&payload.oldData,
+		sizeof(payload.oldData),
+		NULL);
 	if (!NT_SUCCESS(status))
 	{
 		goto __exit;
@@ -460,34 +510,34 @@ VOID INJECT_ROUTINE_X86(
 	//4.申请内存
 	//
 	status = pfn_NtAllocateVirtualMemory(NtCurrentProcess(),
-										 &alloc_ptr,
-										 NULL,
-										 &alloc_size,
-										 MEM_COMMIT,
-										 PAGE_EXECUTE_READWRITE);
+		&alloc_ptr,
+		NULL,
+		&alloc_size,
+		MEM_COMMIT,
+		PAGE_EXECUTE_READWRITE);
 	if (!NT_SUCCESS(status))
 	{
 		goto __exit;
 	}
 	trace = 5;
 	//
-	//5. Hook ZwTestAlert 
+	//5. Hook ZwContinue 
 	//
 
 	//计算dll 和shellcode位置
-	dllPos = (ULONG)alloc_ptr + sizeof(INJECT_PROCESSID_PAYLOAD_X86) - 2;
+	dllPos = PtrToUlong(alloc_ptr) + sizeof(INJECT_PROCESSID_PAYLOAD_X86) - 2;
 	shellcodePos = dllPos + g_injectDll.x86dllsize;
 
 	//恢复hook
 	dwTmpBuf = sizeof(payload.oldData);
 	memcpy(&payload.restoneHook[1], &dwTmpBuf, sizeof(ULONG));
-	dwTmpBuf = (ULONG)alloc_ptr + (sizeof(INJECT_PROCESSID_PAYLOAD_X86) - 7);
+	dwTmpBuf = PtrToUlong(alloc_ptr) + (sizeof(INJECT_PROCESSID_PAYLOAD_X86) - 7);
 	memcpy(&payload.restoneHook[6], &dwTmpBuf, sizeof(ULONG));
-	memcpy(&payload.restoneHook[11], &pfnZwTestAlert, sizeof(ULONG));
+	memcpy(&payload.restoneHook[11], &pfnZwContinue, sizeof(ULONG));
 
 	//调用内存加载
 	memcpy(&payload.invokeMemLoad[1], &dllPos, sizeof(ULONG));
-	dwTmpBuf = shellcodePos - ((ULONG)alloc_ptr + 24) - 5;
+	dwTmpBuf = shellcodePos - (PtrToUlong(alloc_ptr) + 24) - 5;
 	memcpy(&payload.invokeMemLoad[6], &dwTmpBuf, sizeof(ULONG));
 
 
@@ -497,14 +547,14 @@ VOID INJECT_ROUTINE_X86(
 	memcpy(&payload.eraseDll[8], &dllPos, sizeof(ULONG));
 
 	//跳回去
-	dwTmpBuf = (ULONG)pfnZwTestAlert - ((ULONG)alloc_ptr + (sizeof(INJECT_PROCESSID_PAYLOAD_X86) - 12)) - 5;
+	dwTmpBuf = (ULONG)pfnZwContinue - (PtrToUlong(alloc_ptr) + (sizeof(INJECT_PROCESSID_PAYLOAD_X86) - 12)) - 5;
 	memcpy(&payload.jmpOld[1], &dwTmpBuf, sizeof(ULONG));
 
 	status = pfn_NtWriteVirtualMemory(NtCurrentProcess(),
-									  alloc_ptr,
-									  &payload,
-									  sizeof(payload),
-									  &returnLen);
+		alloc_ptr,
+		&payload,
+		sizeof(payload),
+		&returnLen);
 	if (!NT_SUCCESS(status))
 	{
 		goto __exit;
@@ -513,10 +563,10 @@ VOID INJECT_ROUTINE_X86(
 
 
 	status = pfn_NtWriteVirtualMemory(NtCurrentProcess(),
-									  (PVOID)dllPos,
-									  g_injectDll.x86dll,
-									  g_injectDll.x86dllsize,
-									  &returnLen);
+		(PVOID)dllPos,
+		g_injectDll.x86dll,
+		g_injectDll.x86dllsize,
+		&returnLen);
 	if (!NT_SUCCESS(status))
 	{
 		goto __exit;
@@ -525,10 +575,10 @@ VOID INJECT_ROUTINE_X86(
 
 
 	status = pfn_NtWriteVirtualMemory(NtCurrentProcess(),
-									  (PVOID)shellcodePos,
-									  &MemLoadShellcode_x86,
-									  sizeof(MemLoadShellcode_x86),
-									  &returnLen);
+		(PVOID)shellcodePos,
+		&MemLoadShellcode_x86,
+		sizeof(MemLoadShellcode_x86),
+		&returnLen);
 	if (!NT_SUCCESS(status))
 	{
 		goto __exit;
@@ -540,18 +590,18 @@ VOID INJECT_ROUTINE_X86(
 	//Hook
 	//
 
-	dwTmpBuf = (ULONG)alloc_ptr - (ULONG)pfnZwTestAlert - 5;
+	dwTmpBuf = PtrToUlong(alloc_ptr) - (ULONG)pfnZwContinue - 5;
 	hookbuf[0] = 0xE9;
 	memcpy(&hookbuf[1], &dwTmpBuf, sizeof(ULONG));
 
 
 	//备份一遍原地址
-	pZwTestAlert = (PVOID)pfnZwTestAlert;
+	pZwContinue = (PVOID)pfnZwContinue;
 	status = pfn_NtProtectVirtualMemory(NtCurrentProcess(),
-										(PVOID*)&pfnZwTestAlert,
-										&alloc_pagesize,
-										PAGE_EXECUTE_READWRITE,
-										&alloc_oldProtect);
+		(PVOID*)&pfnZwContinue,
+		&alloc_pagesize,
+		PAGE_EXECUTE_READWRITE,
+		&alloc_oldProtect);
 	if (!NT_SUCCESS(status))
 	{
 		goto __exit;
@@ -559,10 +609,10 @@ VOID INJECT_ROUTINE_X86(
 	trace = 9;
 
 	status = pfn_NtWriteVirtualMemory(NtCurrentProcess(),
-									  (PVOID)pZwTestAlert,
-									  &hookbuf,
-									  sizeof(hookbuf),
-									  &returnLen);
+		(PVOID)pZwContinue,
+		&hookbuf,
+		sizeof(hookbuf),
+		&returnLen);
 	if (!NT_SUCCESS(status))
 	{
 		goto __exit;
@@ -571,9 +621,9 @@ VOID INJECT_ROUTINE_X86(
 
 
 __exit:
-	DbgPrint("%s TRACE:%d status = %08X \n", __FUNCTION__, trace, status);
-	if (attach){ KeUnstackDetachProcess(&apc); }
-	ExFreePoolWithTag(StartContext, TAG_INJECTDATA);
+	DPRINT("%s TRACE:%d status = %08X \n", __FUNCTION__, trace, status);
+	if (attach) { KeUnstackDetachProcess(&apc); }
+	ExFreeToNPagedLookasideList(&g_injectDataLookaside, StartContext);
 	PsTerminateSystemThread(0);
 
 }
@@ -582,10 +632,10 @@ VOID INJECT_ROUTINE_X64(
 	_In_ PVOID StartContext)
 {
 	PINJECT_PROCESSID_DATA	injectdata = (PINJECT_PROCESSID_DATA)StartContext;
-	DbgPrint("x64注入 pid=%d %p\n", injectdata->pid, injectdata->imagebase);
+	DPRINT("x64注入 pid=%d %p\n", injectdata->pid, injectdata->imagebase);
 
 	//
-	//1.attach进程，2.找导出表ZwTestAlert 3.组合shellcode 4.申请内存  5.Hook ZwTestAlert 
+	//1.attach进程，2.找导出表ZwContinue 3.组合shellcode 4.申请内存  5.Hook ZwContinue 
 	//
 
 	ULONG			trace = 1;
@@ -595,8 +645,8 @@ VOID INJECT_ROUTINE_X64(
 	KAPC_STATE		apc;
 	BOOLEAN			attach = false;
 
-	ULONG64			pfnZwTestAlert = 0;
-	PVOID			pZwTestAlert;
+	ULONG64			pfnZwContinue = 0;
+	PVOID			pZwContinue;
 
 	PVOID			alloc_ptr = NULL;
 	SIZE_T			alloc_size = 0;
@@ -622,27 +672,27 @@ VOID INJECT_ROUTINE_X64(
 	{
 		goto __exit;
 	}
+	ObDereferenceObject(process);
+
 	trace = 2;
 	KeStackAttachProcess(process, &apc);
 	attach = true;
 
-	ObDereferenceObject(process);
-
 	//
-	//2.找导出表ZwTestAlert
+	//2.找导出表ZwContinue
 	//
-	pfnZwTestAlert = GetProcAddressR((ULONG_PTR)injectdata->imagebase, "ZwTestAlert", true);
-	if (pfnZwTestAlert == NULL)
+	pfnZwContinue = GetProcAddressR((ULONG_PTR)injectdata->imagebase, "ZwContinue", true);
+	if (pfnZwContinue == NULL)
 	{
 		goto __exit;
 	}
 	trace = 3;
 
 	status = pfn_NtReadVirtualMemory(NtCurrentProcess(),
-									 (PVOID)pfnZwTestAlert,
-									 &payload.oldData,
-									 sizeof(payload.oldData),
-									 NULL);
+		(PVOID)pfnZwContinue,
+		&payload.oldData,
+		sizeof(payload.oldData),
+		NULL);
 	if (!NT_SUCCESS(status))
 	{
 		goto __exit;
@@ -654,15 +704,21 @@ VOID INJECT_ROUTINE_X64(
 	//
 	alloc_size = sizeof(INJECT_PROCESSID_PAYLOAD_X64) + sizeof(MemLoadShellcode_x64) + g_injectDll.x64dllsize;
 
+	UCHAR saveReg[] = "\x50\x51\x52\x53\x6A\xFF\x55\x56\x57\x41\x50\x41\x51\x6A\x10\x41\x53\x41\x54\x41\x55\x41\x56\x41\x57";
+	UCHAR restoneReg[] = "\x41\x5F\x41\x5E\x41\x5D\x41\x5C\x41\x5B\x41\x5A\x41\x59\x41\x58\x5F\x5E\x5D\x48\x83\xC4\x08\x5B\x5A\x59\x58";
+
+	memcpy(payload.saveReg, saveReg, sizeof(saveReg));
+	memcpy(payload.restoneReg, restoneReg, sizeof(restoneReg));
+
 	payload.subStack[0] = 0x48;
 	payload.subStack[1] = 0x83;
 	payload.subStack[2] = 0xec;
-	payload.subStack[3] = 0x20;
+	payload.subStack[3] = 0x28;
 
 	payload.addStack[0] = 0x48;
 	payload.addStack[1] = 0x83;
 	payload.addStack[2] = 0xc4;
-	payload.addStack[3] = 0x20;
+	payload.addStack[3] = 0x28;
 
 	payload.restoneHook[0] = 0x48;
 	payload.restoneHook[1] = 0xb9; // mov rcx,len
@@ -694,18 +750,18 @@ VOID INJECT_ROUTINE_X64(
 	//4.申请内存
 	//
 	status = pfn_NtAllocateVirtualMemory(NtCurrentProcess(),
-										 &alloc_ptr,
-										 NULL,
-										 &alloc_size,
-										 MEM_COMMIT,
-										 PAGE_EXECUTE_READWRITE);
+		&alloc_ptr,
+		NULL,
+		&alloc_size,
+		MEM_COMMIT,
+		PAGE_EXECUTE_READWRITE);
 	if (!NT_SUCCESS(status))
 	{
 		goto __exit;
 	}
 	trace = 5;
 	//
-	//5. Hook ZwTestAlert 
+	//5. Hook ZwContinue 
 	//
 	dllPos = ULONG64(alloc_ptr) + (sizeof(INJECT_PROCESSID_PAYLOAD_X64) - 2);
 	shellcodePos = dllPos + g_injectDll.x64dllsize;
@@ -715,12 +771,12 @@ VOID INJECT_ROUTINE_X64(
 	dwTmpBuf = sizeof(payload.oldData);
 	memcpy(&payload.restoneHook[2], &dwTmpBuf, sizeof(ULONG64));
 	dwTmpBuf = (ULONG64)alloc_ptr + (sizeof(INJECT_PROCESSID_PAYLOAD_X64) - 16);
-	memcpy(&payload.restoneHook[12], &pfnZwTestAlert, sizeof(ULONG64));
+	memcpy(&payload.restoneHook[12], &pfnZwContinue, sizeof(ULONG64));
 	memcpy(&payload.restoneHook[22], &dwTmpBuf, sizeof(ULONG64));
 
 	//调用内存加载
 	memcpy(&payload.invokeMemLoad[2], &dllPos, sizeof(ULONG64));
-	dwTmpBuf2 = (ULONG)(shellcodePos - ((ULONG64)alloc_ptr + 46) - 5);
+	dwTmpBuf2 = (ULONG)(shellcodePos - ((ULONG64)alloc_ptr + 0x47) - 5);
 	memcpy(&payload.invokeMemLoad[11], &dwTmpBuf2, sizeof(ULONG));
 
 
@@ -730,14 +786,14 @@ VOID INJECT_ROUTINE_X64(
 	memcpy(&payload.eraseDll[14], &dwTmpBuf, sizeof(ULONG64));
 
 	//跳回去
-	memcpy(&payload.jmpOld[6], &pfnZwTestAlert, sizeof(ULONG64));
+	memcpy(&payload.jmpOld[6], &pfnZwContinue, sizeof(ULONG64));
 
 
 	status = pfn_NtWriteVirtualMemory(NtCurrentProcess(),
-									  alloc_ptr,
-									  &payload,
-									  sizeof(payload),
-									  &returnLen);
+		alloc_ptr,
+		&payload,
+		sizeof(payload),
+		&returnLen);
 	if (!NT_SUCCESS(status))
 	{
 		goto __exit;
@@ -745,10 +801,10 @@ VOID INJECT_ROUTINE_X64(
 	trace = 6;
 
 	status = pfn_NtWriteVirtualMemory(NtCurrentProcess(),
-									  (PVOID)dllPos,
-									  g_injectDll.x64dll,
-									  g_injectDll.x64dllsize,
-									  &returnLen);
+		(PVOID)dllPos,
+		g_injectDll.x64dll,
+		g_injectDll.x64dllsize,
+		&returnLen);
 	if (!NT_SUCCESS(status))
 	{
 		goto __exit;
@@ -756,10 +812,10 @@ VOID INJECT_ROUTINE_X64(
 	trace = 7;
 
 	status = pfn_NtWriteVirtualMemory(NtCurrentProcess(),
-									  (PVOID)shellcodePos,
-									  &MemLoadShellcode_x64,
-									  sizeof(MemLoadShellcode_x64),
-									  &returnLen);
+		(PVOID)shellcodePos,
+		&MemLoadShellcode_x64,
+		sizeof(MemLoadShellcode_x64),
+		&returnLen);
 	if (!NT_SUCCESS(status))
 	{
 		goto __exit;
@@ -774,13 +830,13 @@ VOID INJECT_ROUTINE_X64(
 	hookbuf[1] = 0x25;
 	memcpy(&hookbuf[6], &alloc_ptr, sizeof(ULONG64));
 
-	pZwTestAlert = (PVOID)pfnZwTestAlert;
+	pZwContinue = (PVOID)pfnZwContinue;
 
 	status = pfn_NtProtectVirtualMemory(NtCurrentProcess(),
-										(PVOID*)&pfnZwTestAlert,
-										&alloc_pagesize,
-										PAGE_EXECUTE_READWRITE,
-										&alloc_oldProtect);
+		(PVOID*)&pfnZwContinue,
+		&alloc_pagesize,
+		PAGE_EXECUTE_READWRITE,
+		&alloc_oldProtect);
 	if (!NT_SUCCESS(status))
 	{
 		goto __exit;
@@ -788,10 +844,10 @@ VOID INJECT_ROUTINE_X64(
 	trace = 9;
 
 	status = pfn_NtWriteVirtualMemory(NtCurrentProcess(),
-									  (PVOID)pZwTestAlert,
-									  &hookbuf,
-									  sizeof(hookbuf),
-									  &returnLen);
+		(PVOID)pZwContinue,
+		&hookbuf,
+		sizeof(hookbuf),
+		&returnLen);
 	if (!NT_SUCCESS(status))
 	{
 		goto __exit;
@@ -800,9 +856,9 @@ VOID INJECT_ROUTINE_X64(
 
 
 __exit:
-	DbgPrint("%s TRACE:%d status = %08X \n", __FUNCTION__, trace, status);
-	if (attach){ KeUnstackDetachProcess(&apc); }
-	ExFreePoolWithTag(StartContext, TAG_INJECTDATA);
+	DPRINT("%s TRACE:%d status = %08X \n", __FUNCTION__, trace, status);
+	if (attach) { KeUnstackDetachProcess(&apc); }
+	ExFreeToNPagedLookasideList(&g_injectDataLookaside, StartContext);
 	PsTerminateSystemThread(0);
 
 }
@@ -811,7 +867,7 @@ VOID LoadImageNotify(
 	_In_ PUNICODE_STRING FullImageName,
 	_In_ HANDLE ProcessId,
 	_In_ PIMAGE_INFO ImageInfo
-	)
+)
 {
 	//
 	//过滤system进程
@@ -845,32 +901,6 @@ VOID LoadImageNotify(
 
 
 	//
-	//是否是ntdll加载时机？
-	//
-
-	if (x64Process)
-	{
-		UNICODE_STRING	ntdll_fullimage;
-		RtlInitUnicodeString(&ntdll_fullimage, L"\\SystemRoot\\System32\\ntdll.dll");
-
-		if (RtlCompareUnicodeString(FullImageName, &ntdll_fullimage, TRUE) != 0)
-		{
-			return;
-		}
-	}
-	else
-	{
-		UNICODE_STRING	ntdll_fullimage;
-		RtlInitUnicodeString(&ntdll_fullimage, L"\\SystemRoot\\SysWOW64\\ntdll.dll");
-
-		if (RtlCompareUnicodeString(FullImageName, &ntdll_fullimage, TRUE) != 0)
-		{
-			return;
-		}
-	}
-
-
-	//
 	//是否已经传入注入DLL
 	//
 	if (x64Process)
@@ -898,6 +928,31 @@ VOID LoadImageNotify(
 		return;
 	}
 
+ 
+	//
+	//是否是ntdll加载时机？
+	//
+
+	if (x64Process)
+	{
+		UNICODE_STRING	ntdll_fullimage;
+		RtlInitUnicodeString(&ntdll_fullimage, L"\\System32\\ntdll.dll");
+ 		if (SafeSearchString(FullImageName, &ntdll_fullimage, TRUE) == -1)
+		{
+			return;
+		}
+	}
+	else
+	{
+		UNICODE_STRING	ntdll_fullimage;
+		RtlInitUnicodeString(&ntdll_fullimage, L"\\SysWOW64\\ntdll.dll");
+
+		if (SafeSearchString(FullImageName, &ntdll_fullimage, TRUE) == -1)
+		{
+			return;
+		}
+	}
+
 	//
 	//开始注入
 	//
@@ -906,7 +961,7 @@ VOID LoadImageNotify(
 	HANDLE		thread_hanlde;
 	PVOID		thread_object;
 	PINJECT_PROCESSID_DATA	injectdata = (PINJECT_PROCESSID_DATA)\
-		ExAllocatePoolWithTag(NonPagedPool, sizeof(INJECT_PROCESSID_DATA), TAG_INJECTDATA);
+		ExAllocateFromNPagedLookasideList(&g_injectDataLookaside);
 
 	if (injectdata == NULL)
 	{
@@ -917,13 +972,14 @@ VOID LoadImageNotify(
 	injectdata->imagebase = ImageInfo->ImageBase;
 	injectdata->imagesize = ImageInfo->ImageSize;
 
-	status = PsCreateSystemThread(&thread_hanlde,
-								  THREAD_ALL_ACCESS,
-								  NULL,
-								  NtCurrentProcess(),
-								  NULL,
-								  x64Process ? INJECT_ROUTINE_X64 : INJECT_ROUTINE_X86,
-								  injectdata);
+	status = PsCreateSystemThread(
+		&thread_hanlde,
+		THREAD_ALL_ACCESS,
+		NULL,
+		NtCurrentProcess(),
+		NULL,
+		x64Process ? INJECT_ROUTINE_X64 : INJECT_ROUTINE_X86,
+		injectdata);
 	if (NT_SUCCESS(status))
 	{
 		//添加到已经注入列表里面
@@ -937,9 +993,8 @@ VOID LoadImageNotify(
 			ObDereferenceObject(thread_object);
 		}
 
-		NtClose(thread_hanlde);
+		ZwClose(thread_hanlde);
 	}
-
 
 }
 
@@ -947,7 +1002,7 @@ VOID CreateProcessNotify(
 	_In_ HANDLE ParentId,
 	_In_ HANDLE ProcessId,
 	_In_ BOOLEAN Create
-	)
+)
 {
 	UNREFERENCED_PARAMETER(ParentId);
 
@@ -967,25 +1022,49 @@ VOID CreateProcessNotify(
 	//
 	if (Create)
 	{
+		DPRINT("AddInjectList -> %d\n", ProcessId);
 		AddInjectList(ProcessId);
 	}
 	else
 	{
+		DPRINT("DeleteInjectList -> %d\n", ProcessId);
 		DeleteInjectList(ProcessId);
 	}
 
 }
 
 
-
 VOID DriverUnload(
 	IN PDRIVER_OBJECT DriverObject)
 {
+
 	PsSetCreateProcessNotifyRoutine(CreateProcessNotify, true);
 	PsRemoveLoadImageNotifyRoutine(LoadImageNotify);
+
 	NTDLL::Deinitialize();
+
 	IoDeleteSymbolicLink(&Win32Device);
 	IoDeleteDevice(DriverObject->DeviceObject);
+
+	if (g_injectDll.x64dll != NULL)
+	{
+		ExFreePoolWithTag(g_injectDll.x64dll, 'd64x');
+	}
+	if (g_injectDll.x86dll != NULL)
+	{
+		ExFreePoolWithTag(g_injectDll.x86dll, 'd68x');
+	}
+
+	while (!IsListEmpty(&g_injectList.link))
+	{
+		PINJECT_PROCESSID_LIST next = (PINJECT_PROCESSID_LIST)g_injectList.link.Blink;
+		RemoveEntryList(&next->link);
+		ExFreeToNPagedLookasideList(&g_injectListLookaside, &next->link);
+	}
+
+	ExDeleteResourceLite(&g_ResourceMutex);
+	ExDeleteNPagedLookasideList(&g_injectListLookaside);
+	ExDeleteNPagedLookasideList(&g_injectDataLookaside);
 
 }
 
@@ -1034,6 +1113,12 @@ NTSTATUS DriverControlHandler(
 	{
 		if (g_injectDll.x86dll == NULL && g_injectDll.x86dllsize == 0)
 		{
+			PIMAGE_DOS_HEADER dosHeadPtr = (PIMAGE_DOS_HEADER)inBuf;
+			if (dosHeadPtr->e_magic != IMAGE_DOS_SIGNATURE)
+			{
+				break;
+			}
+
 			g_injectDll.x86dll = ExAllocatePoolWithTag(NonPagedPool, inBufLength, 'd68x');
 			if (g_injectDll.x86dll != NULL)
 			{
@@ -1048,6 +1133,12 @@ NTSTATUS DriverControlHandler(
 	{
 		if (g_injectDll.x64dll == NULL && g_injectDll.x64dllsize == 0)
 		{
+			PIMAGE_DOS_HEADER dosHeadPtr = (PIMAGE_DOS_HEADER)inBuf;
+			if (dosHeadPtr->e_magic != IMAGE_DOS_SIGNATURE)
+			{
+				break;
+			}
+
 			g_injectDll.x64dll = ExAllocatePoolWithTag(NonPagedPool, inBufLength, 'd64x');
 			if (g_injectDll.x64dll != NULL)
 			{
@@ -1079,9 +1170,10 @@ End:
 
 extern "C"
 NTSTATUS DriverEntry(
-IN PDRIVER_OBJECT DriverObject,
-IN PUNICODE_STRING  RegistryPath)
+	IN PDRIVER_OBJECT DriverObject,
+	IN PUNICODE_STRING  RegistryPath)
 {
+ 
 	UNREFERENCED_PARAMETER(RegistryPath);
 	PDEVICE_OBJECT DeviceObject = NULL;
 	NTSTATUS status;
@@ -1096,41 +1188,41 @@ IN PUNICODE_STRING  RegistryPath)
 	//read ntdll.dll from disk so we can use it for exports
 	if (!NT_SUCCESS(NTDLL::Initialize()))
 	{
-		DbgPrint("[DeugMessage] Ntdll::Initialize() failed...\r\n");
+		DPRINT("[DeugMessage] Ntdll::Initialize() failed...\r\n");
 		return STATUS_UNSUCCESSFUL;
 	}
 
 	//initialize undocumented APIs
 	if (!Undocumented::UndocumentedInit())
 	{
-		DbgPrint("[DeugMessage] UndocumentedInit() failed...\r\n");
+		DPRINT("[DeugMessage] UndocumentedInit() failed...\r\n");
 		return STATUS_UNSUCCESSFUL;
 	}
-	DbgPrint("[DeugMessage] UndocumentedInit() was successful!\r\n");
+	DPRINT("[DeugMessage] UndocumentedInit() was successful!\r\n");
 
-	//create io device
+	//create io device ,use fake device name
 	RtlInitUnicodeString(&DeviceName, L"\\Device\\CrashDumpUpload");
 	RtlInitUnicodeString(&Win32Device, L"\\DosDevices\\CrashDumpUpload");
 	status = IoCreateDevice(DriverObject,
-							0,
-							&DeviceName,
-							FILE_DEVICE_UNKNOWN,
-							FILE_DEVICE_SECURE_OPEN,
-							FALSE,
-							&DeviceObject);
+		0,
+		&DeviceName,
+		FILE_DEVICE_UNKNOWN,
+		FILE_DEVICE_SECURE_OPEN,
+		FALSE,
+		&DeviceObject);
 	if (!NT_SUCCESS(status))
 	{
 		NTDLL::Deinitialize();
-		DbgPrint("[DeugMessage] IoCreateDevice Error...\r\n");
+		DPRINT("[DeugMessage] IoCreateDevice Error...\r\n");
 		return status;
 	}
 	if (!DeviceObject)
 	{
 		NTDLL::Deinitialize();
-		DbgPrint("[DeugMessage] Unexpected I/O Error...\r\n");
+		DPRINT("[DeugMessage] Unexpected I/O Error...\r\n");
 		return STATUS_UNEXPECTED_IO_ERROR;
 	}
-	DbgPrint("[DeugMessage] Device %.*ws created successfully!\r\n", DeviceName.Length / sizeof(WCHAR), DeviceName.Buffer);
+	DPRINT("[DeugMessage] Device %.*ws created successfully!\r\n", DeviceName.Length / sizeof(WCHAR), DeviceName.Buffer);
 
 	//create symbolic link
 	DeviceObject->Flags |= DO_BUFFERED_IO;
@@ -1140,16 +1232,19 @@ IN PUNICODE_STRING  RegistryPath)
 	{
 		NTDLL::Deinitialize();
 		IoDeleteDevice(DriverObject->DeviceObject);
-		DbgPrint("[DeugMessage] IoCreateSymbolicLink Error...\r\n");
+		DPRINT("[DeugMessage] IoCreateSymbolicLink Error...\r\n");
 		return status;
 	}
-	DbgPrint("[DeugMessage] Symbolic link %.*ws->%.*ws created!\r\n", Win32Device.Length / sizeof(WCHAR), Win32Device.Buffer, DeviceName.Length / sizeof(WCHAR), DeviceName.Buffer);
+	DPRINT("[DeugMessage] Symbolic link %.*ws->%.*ws created!\r\n", Win32Device.Length / sizeof(WCHAR), Win32Device.Buffer, DeviceName.Length / sizeof(WCHAR), DeviceName.Buffer);
 
 
 	//KdBreakPoint();
 
 	InitializeListHead((PLIST_ENTRY)&g_injectList);
-	ExInitializeFastMutex(&g_GuardMutex);
+	ExInitializeResourceLite(&g_ResourceMutex);
+	ExInitializeNPagedLookasideList(&g_injectListLookaside, NULL, NULL, NULL, sizeof(INJECT_PROCESSID_LIST), TAG_INJECTLIST, NULL);
+	ExInitializeNPagedLookasideList(&g_injectDataLookaside, NULL, NULL, NULL, sizeof(INJECT_PROCESSID_DATA), TAG_INJECTDATA, NULL);
+
 	memset(&g_injectDll, 0, sizeof(INJECT_PROCESSID_DLL));
 
 	pfn_NtAllocateVirtualMemory = (fn_NtAllocateVirtualMemory)SSDT::GetFunctionAddress("NtAllocateVirtualMemory");
